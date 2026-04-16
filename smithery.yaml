@@ -1,0 +1,12 @@
+---
+startCommand:
+  type: http
+  configSchema:
+    type: object
+    properties:
+      ANTHROPIC_API_KEY:
+        type: string
+        description: Your Anthropic API key
+        required: true
+  exampleConfig:
+    ANTHROPIC_API_KEY: sk-ant-xxx

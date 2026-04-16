@@ -3,42 +3,50 @@ import "dotenv/config";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import http from "http";
+import express, { Request, Response } from "express";
 
 import { TOOL_DEFINITIONS } from "./tools/definitions";
 import { handleToolCall } from "./tools/handler";
 
 // ---------------------------------------------------------------------------
-// MCP Server setup
+// MCP Server factory
 // ---------------------------------------------------------------------------
 
-const server = new Server(
-  { name: "docpulse-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+/**
+ * Create a fresh Server instance.  For stateless HTTP mode we call this once
+ * per request so each transport gets its own server with no shared state.
+ */
+function createServer(): Server {
+  const server = new Server(
+    { name: "docpulse-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOL_DEFINITIONS,
-}));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOL_DEFINITIONS,
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    try {
+      const text = await handleToolCall(name, args ?? {});
+      return { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  });
 
-  try {
-    const text = await handleToolCall(name, args ?? {});
-    return { content: [{ type: "text" as const, text }] };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      content: [{ type: "text" as const, text: `Error: ${message}` }],
-      isError: true,
-    };
-  }
-});
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Transport selection
@@ -49,61 +57,42 @@ const PORT = parseInt(process.env["PORT"] ?? "3000", 10);
 
 async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
   process.stderr.write("[docpulse-mcp] Running on stdio transport\n");
 }
 
 /**
- * Minimal HTTP wrapper that exposes a health endpoint and a JSON-RPC endpoint.
+ * Stateless StreamableHTTP mode — required by Smithery and other hosted
+ * MCP runtimes.
  *
- * For production SSE-based MCP over HTTP you would swap this for the
- * @modelcontextprotocol/sdk SSEServerTransport once your hosting environment
- * supports it.
+ * A new transport (and server) instance is created per POST request so there
+ * is no shared transport state across calls.  This is the pattern documented
+ * in the MCP SDK for stateless deployments:
+ *
+ *   sessionIdGenerator: undefined  →  stateless (no Mcp-Session-Id header)
  */
 function startHTTP(): void {
-  const httpServer = http.createServer((req, res) => {
-    // Health check
-    if (req.method === "GET" && req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", name: "docpulse-mcp", version: "1.0.0" }));
-      return;
-    }
+  const app = express();
+  app.use(express.json());
 
-    // MCP JSON-RPC endpoint
-    if (req.method === "POST" && req.url === "/mcp") {
-      let body = "";
-      req.on("data", (chunk: Buffer) => {
-        body += chunk.toString();
-      });
-      req.on("end", async () => {
-        try {
-          const parsed = JSON.parse(body) as {
-            tool?: string;
-            arguments?: unknown;
-            [key: string]: unknown;
-          };
-          const toolName = String(parsed["tool"] ?? "");
-          const toolArgs = parsed["arguments"] ?? {};
-          const result = await handleToolCall(toolName, toolArgs);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ result }));
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: message }));
-        }
-      });
-      return;
-    }
-
-    res.writeHead(404);
-    res.end("Not Found");
+  // ----- MCP endpoint -------------------------------------------------------
+  app.post("/mcp", async (req: Request, res: Response) => {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+    await createServer().connect(transport);
+    await transport.handleRequest(req, res, req.body);
   });
 
-  httpServer.listen(PORT, () => {
+  // ----- Health check -------------------------------------------------------
+  app.get("/health", (_req: Request, res: Response) => {
+    res.json({ status: "ok", name: "docpulse-mcp", version: "1.0.0" });
+  });
+
+  app.listen(PORT, () => {
     process.stderr.write(
       `[docpulse-mcp] HTTP server listening on port ${PORT}\n` +
-        `  POST /mcp   — call a tool\n` +
+        `  POST /mcp    — StreamableHTTP MCP endpoint\n` +
         `  GET  /health — health check\n`
     );
   });
